@@ -19,12 +19,17 @@
 //! In this section, you will explore these mechanisms.
 //!
 
+use std::{collections::HashMap, sync::Arc};
+
 #[allow(unused_imports)]
-use axum::extract::State;
+use axum::extract::{State, Path};
+use axum::{body::Body, response::{IntoResponse, Response}, Json};
 #[allow(unused_imports)]
-use axum::{body::Body, http::Method, routing::*};
+use axum::{http::Method, routing::*};
 #[allow(unused_imports)]
 use hyper::Request;
+use hyper::StatusCode;
+use tokio::sync::Mutex;
 
 ///
 /// EXERCISE 1
@@ -42,13 +47,13 @@ async fn closure_shared_context() {
     /// for ServiceExt::oneshot
     use tower::util::ServiceExt;
 
-    let _gbp_to_usd_rate = 1.3;
+    let gbp_to_usd_rate = 1.3;
 
-    let _app = Router::<()>::new()
-        .route("/usd_to_gbp", get(todo!("Make a closure")))
-        .route("/gbp_to_usd", get(todo!("Make a closure")));
+    let app = Router::new()
+        .route("/usd_to_gbp", get(move |usd: String| async move { convert_usd_to_gbp(usd, gbp_to_usd_rate) }))
+        .route("/gbp_to_usd", get(move |usd: String| async move { convert_gbp_to_usd(usd, gbp_to_usd_rate) }));
 
-    let response = _app
+    let response = app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -66,10 +71,10 @@ async fn closure_shared_context() {
     assert_eq!(_body_as_string, "130");
 }
 fn convert_usd_to_gbp(usd: String, gbp_to_usd_rate: f64) -> String {
-    format!("{}", usd.parse::<f64>().unwrap() * gbp_to_usd_rate)
+    (usd.parse::<f64>().unwrap() * gbp_to_usd_rate).to_string()
 }
 fn convert_gbp_to_usd(gbp: String, gbp_to_usd_rate: f64) -> String {
-    format!("{}", gbp.parse::<f64>().unwrap() / gbp_to_usd_rate)
+    (gbp.parse::<f64>().unwrap() / gbp_to_usd_rate).to_string()
 }
 
 ///
@@ -100,16 +105,23 @@ async fn shared_mutable_context() {
     /// for ServiceExt::oneshot
     use tower::util::ServiceExt;
 
-    let _gbp_to_usd_rate = 1.3;
+    let arc = Arc::new(Mutex::new(1.3));
+    let arc_clone = arc.clone();
 
-    let _app = Router::<()>::new()
+    let _app = Router::new()
         .route(
             "/usd_to_gbp",
-            get(move |usd: String| async move { convert_usd_to_gbp(usd, _gbp_to_usd_rate) }),
+            get(move |usd: String| async move {
+                let rate = *arc.lock().await;
+                convert_usd_to_gbp(usd, rate)
+            }),
         )
         .route(
             "/gbp_to_usd",
-            get(move |gbp: String| async move { convert_gbp_to_usd(gbp, _gbp_to_usd_rate) }),
+            get(move |gbp: String| async move {
+                let rate = *arc_clone.lock().await;
+                convert_gbp_to_usd(gbp, rate)
+            }),
         );
 
     let response = _app
@@ -129,6 +141,9 @@ async fn shared_mutable_context() {
 
     assert_eq!(_body_as_string, "130");
 }
+
+// #[derive(Copy, Clone, Debug, PartialEq)]
+// struct ConversionRate(f64);
 
 ///
 /// EXERCISE 3
@@ -154,10 +169,10 @@ async fn state_shared_context() {
 
     let _gbp_to_usd_rate = 1.3;
 
-    let _app = Router::new()
+    let _app = Router::<f64>::new()
         .route("/usd_to_gbp", get(usd_to_gbp_handler))
         .route("/gbp_to_usd", get(gbp_to_usd_handler))
-        .with_state(());
+        .with_state(_gbp_to_usd_rate);
 
     let response = _app
         .oneshot(
@@ -176,11 +191,11 @@ async fn state_shared_context() {
 
     assert_eq!(_body_as_string, "130");
 }
-async fn usd_to_gbp_handler() -> String {
-    todo!("Use State to access the exchange rate")
+async fn usd_to_gbp_handler(State(rate): State<f64>, amount: String) -> String {
+    convert_usd_to_gbp(amount, rate)
 }
-async fn gbp_to_usd_handler() -> String {
-    todo!("Use State to access the exchange rate")
+async fn gbp_to_usd_handler(State(rate): State<f64>, amount: String) -> String {
+    convert_gbp_to_usd(amount, rate)
 }
 
 ///
@@ -201,12 +216,24 @@ async fn mutable_state_shared_context() {
 
     let _gbp_to_usd_rate = 1.3;
 
-    let _app = Router::new()
+    let app = Router::<Arc<Mutex<f64>>>::new()
         .route("/usd_to_gbp", get(mutable_usd_to_gbp_handler))
         .route("/gbp_to_usd", get(mutable_gbp_to_usd_handler))
-        .with_state(());
+        .route("/set_exchange_rate", put(set_exchange_rate_handler))
+        .with_state(Arc::new(Mutex::new(_gbp_to_usd_rate)));
 
-    let response = _app
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/set_exchange_rate")
+                .body(Body::from("1.7"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = app
         .oneshot(
             Request::builder()
                 .method(Method::GET)
@@ -221,13 +248,16 @@ async fn mutable_state_shared_context() {
 
     let _body_as_string = String::from_utf8(body.to_vec()).unwrap();
 
-    assert_eq!(_body_as_string, "130");
+    assert_eq!(_body_as_string, "170");
 }
-async fn mutable_usd_to_gbp_handler() -> String {
-    todo!("Use State to access the exchange rate")
+async fn mutable_usd_to_gbp_handler(State(rate_arc): State<Arc<Mutex<f64>>>, amount: String) -> String {
+    convert_usd_to_gbp(amount, *rate_arc.lock().await)
 }
-async fn mutable_gbp_to_usd_handler() -> String {
-    todo!("Use State to access the exchange rate")
+async fn mutable_gbp_to_usd_handler(State(rate_arc): State<Arc<Mutex<f64>>>, amount: String) -> String {
+    convert_gbp_to_usd(amount, *rate_arc.lock().await)
+}
+async fn set_exchange_rate_handler(State(rate_arc): State<Arc<Mutex<f64>>>, new_amount: String) -> () {
+    *(rate_arc.lock().await) = new_amount.parse::<f64>().unwrap();
 }
 
 ///
@@ -398,5 +428,119 @@ async fn extension_gbp_to_usd_handler() -> String {
 /// Place it into a web server and test to ensure it meets your requirements.
 ///
 async fn run_users_server() {
-    todo!("Implement the users API")
+    let app = Router::<Arc<Mutex<UsersState>>>::new()
+        .route("/users", get(get_users))
+        .route("/users/:id", get(get_user))
+        .route("/users", post(create_user))
+        .route("/users/:id", put(update_user))
+        .route("/users/:id", delete(delete_user))
+        .with_state(Arc::new(Mutex::new(UsersState::new())));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+
+    println!("Listening on {}", listener.local_addr().unwrap());
+
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn get_users(state: State<Arc<Mutex<UsersState>>>) -> Json<Vec<User>> {
+    Json(state.lock().await.get_users())
+}
+
+async fn get_user(Path(id): Path<u64>, state: State<Arc<Mutex<UsersState>>>) -> Result<Json<User>, MissingUserError> {
+    state.lock().await.get_user(id).map(Json).ok_or(MissingUserError("".to_string()))
+}
+
+async fn create_user(state: State<Arc<Mutex<UsersState>>>, Json(proto_user): Json<ProtoUser>) -> Json<User> {
+    Json(state.lock().await.create_user(proto_user))
+}
+
+async fn update_user(Path(id): Path<u64>, state: State<Arc<Mutex<UsersState>>>, Json(updates): Json<UserUpdate>) -> Result<Json<User>, MissingUserError> {
+    state.lock().await.update_user(id, updates).map(Json).ok_or(MissingUserError("".to_string()))
+}
+
+async fn delete_user(Path(id): Path<u64>, state: State<Arc<Mutex<UsersState>>>) -> Result<Json<User>, MissingUserError> {
+    state.lock().await.delete_user(id).map(Json).ok_or(MissingUserError("".to_string()))
+}
+
+struct UsersState {
+    users: HashMap<u64, User>,
+    next_id: u64,
+}
+
+impl UsersState {
+    fn new() -> Self {
+        Self {
+            users: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    fn get_user(&self, id: u64) -> Option<User> {
+        self.users.get(&id).map(|u| u.clone())
+    }
+
+    fn get_users(&self) -> Vec<User> {
+        self.users.values().map(|u| u.clone()).collect()
+    }
+
+    fn create_user(&mut self, proto_user: ProtoUser) -> User {
+        let new_user = User { id: self.next_id, name: proto_user.name, email: proto_user.email };
+        self.users.insert(self.next_id, new_user.clone());
+        self.next_id += 1;
+        new_user
+    }
+
+    fn update_user(&mut self, id: u64, update: UserUpdate) -> Option<User> {
+        let current_user = self.users.get(&id);
+        if current_user.is_none() {
+            return Option::None
+        }
+        let current_user = current_user.unwrap();
+        let new_user = User {
+            id: current_user.id,
+            name: update.name.unwrap_or_else(|| current_user.name.clone()),
+            email: update.email.unwrap_or_else(|| current_user.email.clone()),
+        };
+        self.users.insert(id, new_user.clone());
+        Option::Some(new_user)
+    }
+
+    fn delete_user(&mut self, id: u64) -> Option<User> {
+        self.users.remove(&id)
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct User {
+    id: u64,
+    name: String,
+    email: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct ProtoUser {
+    name: String,
+    email: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct UserUpdate {
+    name: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct MissingUserError(String);
+
+impl IntoResponse for MissingUserError {
+    fn into_response(self) -> Response {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "application/json")
+            .body(Body::from(format!("{{message:{}}}", serde_json::json!(&self.0))))
+            .unwrap()
+    }
 }

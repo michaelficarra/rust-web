@@ -57,7 +57,7 @@ pub async fn hello_world() {
 /// and that it properly serves the static HTML.
 ///
 async fn handler() -> Html<&'static str> {
-    todo!()
+    Html("<h1>Hello, World!</h1>")
 }
 
 ///
@@ -71,8 +71,13 @@ async fn handler() -> Html<&'static str> {
 /// PUT /users/:id
 /// DELETE /users/:id
 ///
-fn build_router<S: Clone + Send + Sync + 'static>(_router: Router<S>) -> Router<S> {
-    todo!()
+fn build_router<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
+    router
+        .route("/", get(dummy_handler))
+        .route("/users/:id", get(dummy_handler))
+        .route("/users/", post(dummy_handler))
+        .route("/users/:id", put(dummy_handler))
+        .route("/users/:id", delete(dummy_handler))
 }
 
 async fn dummy_handler() -> Html<&'static str> {
@@ -87,9 +92,7 @@ async fn dummy_handler() -> Html<&'static str> {
 /// What are the semantics of the resulting router?
 ///
 fn merge_routers<S: Clone + Send + Sync + 'static>(left: Router<S>, right: Router<S>) -> Router<S> {
-    let (_, _) = (left, right);
-
-    todo!()
+    left.merge(right)
 }
 
 ///
@@ -103,15 +106,15 @@ fn merge_routers<S: Clone + Send + Sync + 'static>(left: Router<S>, right: Route
 /// In the following example, use the `nest` method to nest all of the user
 /// routes under the `/users` path prefix of the specified router.
 ///
-fn nest_router<S: Clone + Send + Sync + 'static>(_router: Router<S>) -> Router<S> {
-    let _user_routes = Router::<S>::new()
+fn nest_router<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
+    let user_routes = Router::<S>::new()
         .route("/", get(handler))
         .route("/:id", get(handler))
         .route("/", post(handler))
         .route("/:id", put(handler))
         .route("/:id", delete(handler));
 
-    todo!()
+    router.nest("/users", user_routes)
 }
 
 ///
@@ -132,11 +135,16 @@ async fn test_routes() {
     /// for ServiceExt::oneshot
     use tower::util::ServiceExt;
 
-    let _app = Router::new().route("/users", get(identity_handler));
+    let app = Router::new().route("/users", get(identity_handler));
 
-    let _req: Request<Body> = todo!("Use Request::builder");
+    let req: Request<Body> =
+        Request::builder()
+            .method(Method::GET)
+            .uri("/users")
+            .body(Body::empty())
+            .unwrap();
 
-    let response = _app.oneshot(_req).await.unwrap();
+    let response = app.oneshot(req).await.unwrap();
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
 
@@ -177,13 +185,27 @@ async fn test_basic_json() {
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
 
-    let _body_as_string = String::from_utf8(body.to_vec()).unwrap();
+    let body_as_string = String::from_utf8(body.to_vec()).unwrap();
 
-    todo!("assert_eq");
+    assert_eq!(body_as_string, "{}");
 }
-async fn return_json_hello_world() -> Json<String> {
-    Json(todo!("Return a JSON response here!"))
+
+async fn return_json_hello_world() -> Json<Dummy> {
+    Json(Dummy{})
 }
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Dummy{}
+
+// impl serde::Serialize for Dummy {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//         where
+//             S: serde::Serializer {
+
+//         use serde::ser::SerializeStruct;
+//         serializer.serialize_struct("Dummy", 0)?.end()
+//     }
+// }
 
 async fn identity_handler(request: Request<Body>) -> Body {
     Body::from(request.uri().path().to_string())

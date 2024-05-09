@@ -33,7 +33,9 @@
 //! 4. Run `sqlx migrate run` to run the migrations in the `migrations` folder.
 //!
 
-use sqlx::{postgres::PgPoolOptions, Postgres};
+use axum::{async_trait, body::Body, extract::{Path, State}, response::{IntoResponse, Response}, routing::{delete, get, post, put}, Json, Router};
+use hyper::StatusCode;
+use sqlx::{postgres::PgPoolOptions, types::time::PrimitiveDateTime, Pool, Postgres};
 
 ///
 /// EXERCISE 1
@@ -49,6 +51,7 @@ use sqlx::{postgres::PgPoolOptions, Postgres};
 /// need to supply a database pool, which you can do so with the `fetch` family of
 /// methods.
 ///
+#[tokio::test]
 async fn query_playground() {
     let _ = sqlx::query!("SELECT 1 + 1 AS sum");
 
@@ -66,13 +69,14 @@ async fn query_playground() {
 ///
 #[tokio::test]
 async fn select_one_plus_one() {
-    let _pool = PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
 
-    let _sum: i32 = todo!("Insert row here");
+    let _sum: i32 = sqlx::query!("SELECT 1 + 1 AS sum")
+        .fetch_one(&pool).await.unwrap().sum.unwrap();
 
     assert_eq!(_sum, 2);
 }
@@ -90,13 +94,18 @@ async fn select_one_plus_one() {
 ///
 #[tokio::test]
 async fn select_star() {
-    let _pool = PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
 
-    todo!("Insert query here");
+    let todos = sqlx::query!("SELECT * FROM todos")
+        .fetch_all(&pool).await.unwrap();
+
+    for todo in todos {
+        println!("{:?}", todo)
+    }
 
     assert!(true);
 }
@@ -117,17 +126,24 @@ async fn select_star() {
 ///
 #[tokio::test]
 async fn insert_todo() {
-    let _pool = PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
 
-    let _title = "Learn SQLx";
-    let _description = "I should really learn SQLx for my Axum web app";
-    let _done = false;
+    let title = "Learn SQLx";
+    let description = "I should really learn SQLx for my Axum web app";
+    let done = false;
 
-    assert!(true);
+    let id = sqlx::query!(
+        "INSERT INTO todos (title, description, done) VALUES ($1, $2, $3) RETURNING id",
+        title,
+        description,
+        done,
+    ).fetch_one(&pool).await.unwrap().id;
+
+    assert!(id > 0);
 }
 
 ///
@@ -139,15 +155,21 @@ async fn insert_todo() {
 /// of the fetch methods.
 ///
 #[tokio::test]
-async fn update_todo() {
-    let _pool = PgPoolOptions::new()
+async fn test_update_todo() {
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
 
-    let _id = 1;
-    let _done = true;
+    let id = 1;
+    let done = true;
+
+    sqlx::query!(
+        "UPDATE todos SET done = $2 WHERE id = $1",
+        id,
+        done,
+    ).execute(&pool).await.unwrap();
 
     assert!(true);
 }
@@ -161,14 +183,16 @@ async fn update_todo() {
 /// of the fetch methods.
 ///
 #[tokio::test]
-async fn delete_todo() {
-    let _pool = PgPoolOptions::new()
+async fn test_delete_todo() {
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
 
-    let _id = 1;
+    let id = 1;
+
+    sqlx::query!("DELETE FROM todos WHERE id = $1", id).execute(&pool).await.unwrap();
 
     assert!(true);
 }
@@ -186,15 +210,103 @@ async fn delete_todo() {
 ///
 #[tokio::test]
 async fn select_star_as() {
-    let _pool = PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&std::env::var("DATABASE_URL").unwrap())
         .await
         .unwrap();
 
-    todo!("Insert query here");
+    sqlx::query_as!(TodoRecord, "SELECT * FROM todos")
+        .fetch_all(&pool).await.unwrap();
 
     assert!(true);
+}
+struct TodoRecord {
+    id: i64,
+    title: String,
+    description: String,
+    done: bool,
+    created_at: PrimitiveDateTime,
+}
+
+#[async_trait]
+trait TodoRepo: Send + Sync {
+    async fn get_all(&self) -> Vec<Todo>;
+    async fn create(&self, title: String, description: String) -> Todo;
+    async fn get(&self, id: i64) -> Option<Todo>;
+    async fn update(&self, id: i64, title: Option<String>, description: Option<String>, done: Option<bool>) -> Option<Todo>;
+    async fn delete(&self, id: i64) -> Option<Todo>;
+}
+
+#[derive(Debug, Clone)]
+struct TodoRepoPostgres {
+    pool: Pool<Postgres>,
+}
+
+impl TodoRepoPostgres {
+    async fn new() -> Self {
+        let pool = PgPoolOptions::new()
+            .max_connections(16)
+            .connect(&std::env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl TodoRepo for TodoRepoPostgres {
+    async fn get_all(&self) -> Vec<Todo> {
+        sqlx::query_as!(TodoRecord, "SELECT * FROM todos")
+            .fetch_all(&self.pool).await.unwrap()
+            .into_iter()
+            .map(|r| Todo::from_record(r))
+            .collect()
+
+    }
+
+    async fn create(&self, title: String, description: String) -> Todo {
+        Todo::from_record(
+            sqlx::query_as!(
+                TodoRecord,
+                "INSERT INTO todos (title, description, done) VALUES ($1, $2, $3) RETURNING *",
+                title,
+                description,
+                false,
+            )
+                .fetch_one(&self.pool).await.unwrap()
+        )
+    }
+
+    async fn get(&self, id: i64) -> Option<Todo> {
+        sqlx::query_as!(TodoRecord, "SELECT * FROM todos WHERE id = $1", &id)
+            .fetch_optional(&self.pool).await.unwrap()
+            .map(|r| Todo::from_record(r))
+    }
+
+    async fn update(&self, id: i64, title: Option<String>, description: Option<String>, done: Option<bool>) -> Option<Todo> {
+        sqlx::query_as!(
+            TodoRecord,
+            "UPDATE todos SET title = COALESCE($1, title), description = COALESCE($2, description), done = COALESCE($3, done) WHERE id = $4 RETURNING *",
+            title,
+            description,
+            done,
+            id,
+        )
+            .fetch_optional(&self.pool).await.unwrap()
+            .map(|r| Todo::from_record(r))
+    }
+
+    async fn delete(&self, id: i64) -> Option<Todo> {
+        sqlx::query_as!(
+            TodoRecord,
+            "DELETE FROM todos WHERE id = $1 RETURNING *",
+            id,
+        )
+            .fetch_optional(&self.pool).await.unwrap()
+            .map(|r| Todo::from_record(r))
+    }
 }
 
 ///
@@ -204,5 +316,85 @@ async fn select_star_as() {
 /// which uses sqlx for persistence.
 ///
 pub async fn run_todo_app() {
-    todo!("Implement todo app");
+    let app = Router::<TodoRepoPostgres>::new()
+        .route("/todos", get(get_todos::<TodoRepoPostgres>))
+        .route("/todos/:id", get(get_todo::<TodoRepoPostgres>))
+        .route("/todos", post(create_todo::<TodoRepoPostgres>))
+        .route("/todos/:id", put(update_todo::<TodoRepoPostgres>))
+        .route("/todos/:id", delete(delete_todo::<TodoRepoPostgres>))
+        .with_state(TodoRepoPostgres::new().await);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+
+    println!("Listening on {}", listener.local_addr().unwrap());
+
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn get_todos<R: TodoRepo>(state: State<R>) -> Json<Vec<Todo>> {
+    Json((*state).get_all().await)
+}
+
+async fn get_todo<R: TodoRepo>(Path(id): Path<i64>, state: State<R>) -> Result<Json<Todo>, MissingTodoError> {
+    (*state).get(id).await.map(Json).ok_or_else(|| MissingTodoError("".to_string()))
+}
+
+async fn create_todo<R: TodoRepo>(state: State<R>, Json(spec): Json<CreateTodo>) -> Json<Todo> {
+    Json((*state).create(spec.title, spec.description).await)
+}
+
+async fn update_todo<R: TodoRepo>(Path(id): Path<i64>, state: State<R>, Json(update): Json<UpdateTodo>) -> Result<Json<Todo>, MissingTodoError> {
+    (*state).update(id, update.title, update.description, update.done).await
+        .map(Json).ok_or_else(|| MissingTodoError("".to_string()))
+}
+
+async fn delete_todo<R: TodoRepo>(Path(id): Path<i64>, state: State<R>) -> Result<Json<Todo>, MissingTodoError> {
+    (*state).delete(id).await.map(Json).ok_or_else(|| MissingTodoError("".to_string()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct Todo {
+    id: i64,
+    title: String,
+    description: String,
+    done: bool,
+}
+
+impl Todo {
+    fn from_record(record: TodoRecord) -> Self {
+        Todo {
+            id: record.id,
+            title: record.title,
+            description: record.description,
+            done: record.done,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CreateTodo {
+    title: String,
+    description: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateTodo {
+    title: Option<String>,
+    description: Option<String>,
+    done: Option<bool>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq, Eq)]
+struct MissingTodoError(String);
+
+impl IntoResponse for MissingTodoError {
+    fn into_response(self) -> Response {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("Content-Type", "application/json")
+            .body(Body::from(format!("{{message:{}}}", serde_json::json!(&self.0))))
+            .unwrap()
+    }
 }
